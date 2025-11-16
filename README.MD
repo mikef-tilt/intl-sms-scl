@@ -1,0 +1,1 @@
+Please note, CUDA 13.0 was used to train this model
