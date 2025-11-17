@@ -1,18 +1,16 @@
 """
-Script to train SbertSupConEncoder on SMS data with labels.
+Script to train TfidfSupDTEncoder on SMS data with labels.
 
 This script:
 1. Loads training/test spine data with labels
 2. Queries SMS data in chunks with time-window aggregation
 3. Joins SMS data with labels
-4. Truncates text to fit within 4096 tokens (BGE-M3 with optimized speed)
-5. Trains the SbertSupConEncoder model
+4. Trains the TfidfSupDTEncoder model using supervised TF-IDF with Decision Tree feature selection
 """
 
 from helpers import TableManager
 from data_helper import *
-from transformer import SbertSupConEncoder
-from transformers import AutoTokenizer
+from tfidf_transformer import TfidfSupDTEncoder
 import polars as pl
 import pickle
 import os
@@ -28,37 +26,30 @@ CONTAINER_NAME = "mike"
 DIRECTORY_PATH = "data-tmp/ensenada/raw"
 
 # Date ranges
-TRAIN_START_DATE = "2025-07-16"
+TRAIN_START_DATE = "2025-08-01"
 TRAIN_END_DATE = "2025-09-01"
 TEST_START_DATE = "2025-09-01"
 TEST_END_DATE = "2025-09-15"
 
 # SMS query configuration
-DAYS_PRIOR = 14
+DAYS_PRIOR = 28
 SMS_SEPARATOR = '---'
-MAX_TOKENS = 4096  # Reduced from 8192 to 4096 for faster training (mean was ~3800)
 CHUNK_SIZE = 20000  # Number of UserLoanIds to process per chunk
 
-# Model configuration
-# Model options:
-# - 'BAAI/bge-m3': 8192 tokens, 1024 dims, multilingual, state-of-the-art (~4-5 it/s)
-# - 'jaimevera1107/all-MiniLM-L6-v2-similarity-es': 256 tokens, 384 dims, faster training (~6 it/s)
-# - 'hiiamsid/sentence_similarity_spanish_es': 512 tokens, 768 dims, slower training (~2 it/s)
-MODEL_NAME = 'BAAI/bge-m3'
-# MODEL_NAME = 'jaimevera1107/all-MiniLM-L6-v2-similarity-es'  # Uncomment for smaller, faster model
-# MODEL_NAME = 'hiiamsid/sentence_similarity_spanish_es'  # Uncomment for larger Spanish-specific model
-EMBEDDING_DIM = 32  # Reduced to 32 for faster training and better generalization
-N_EPOCHS = 1  # Keep at 1 for faster training
-BATCH_SIZE = 8  # Increased to 8 with smaller tokens (4096) and embedding dims (32)
-LEARNING_RATE = 1e-4  # Reduced from 2e-4 for larger model stability
-GRADIENT_CHECKPOINTING = True  # Enable gradient checkpointing to save GPU memory
-TEMPERATURE = 0.07
-DEVICE = 'cuda'
+# TF-IDF Model configuration
+N_FEATURES = 100  # Number of top features to select based on decision tree importance
+MAX_FEATURES = 10000  # Maximum number of features for initial TF-IDF vectorization
+MIN_DF = 2  # Minimum document frequency
+MAX_DF = 0.95  # Maximum document frequency
+NGRAM_RANGE = (1, 2)  # Unigrams and bigrams
+DT_MAX_DEPTH = 10  # Maximum depth of decision tree for feature selection
+DT_MIN_SAMPLES_SPLIT = 100  # Minimum samples to split in decision tree
+N_JOBS = -1  # Number of parallel jobs for preprocessing (-1 = use all CPUs)
 RANDOM_STATE = 42
 
 # Cache configuration
 CACHE_DIR = "cache"
-ENCODER_CACHE_FILE = "cache/sbert_encoder.pkl"
+ENCODER_CACHE_FILE = "cache/tfidf_encoder.pkl"
 TRAIN_DATA_CACHE_FILE = "cache/train_data.parquet"
 TEST_DATA_CACHE_FILE = "cache/test_data.parquet"
 USE_CACHE = True  # Set to False to force retraining and reprocessing
@@ -125,10 +116,6 @@ def main():
         else:
             print("\n⚠ No cached processed data found, will process from scratch")
 
-        # Load tokenizer
-        print(f"\nLoading tokenizer: {MODEL_NAME}")
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-
         # Process training data
         print(f"\n{'='*60}")
         print("Processing Training Data")
@@ -137,7 +124,6 @@ def main():
 
         print(f"Processing {len(df_train_spine):,} training UserLoanIds in chunks...")
         print(f"  Lookback window: {DAYS_PRIOR} days")
-        print(f"  Max tokens: {MAX_TOKENS}")
 
         train_chunks = []
         train_user_loan_ids = [str(uid) for uid in df_train_spine['UserLoanId']]
@@ -149,12 +135,19 @@ def main():
             days_prior=DAYS_PRIOR,
             separator=SMS_SEPARATOR
         ), start=1):
-            df_chunk = process_sms_chunk(df_sms, df_train_labels, tokenizer, max_tokens=MAX_TOKENS)
-            print_chunk_stats(i, df_sms, df_chunk)
+            # Simple join with labels (no tokenization needed for TF-IDF)
+            df_chunk = df_sms.join(df_train_labels, on=['UserLoanId', 'CreatedAt'], how='inner')
+            print(f"\nChunk {i}:")
+            print(f"  SMS rows before join: {len(df_sms):,}")
+            print(f"  Rows after join: {len(df_chunk):,}")
             train_chunks.append(df_chunk)
 
         df_train = pl.concat(train_chunks)
-        print_final_stats(df_train, "Training")
+        print(f"\n{'='*60}")
+        print(f"Training Data Summary")
+        print(f"{'='*60}")
+        print(f"  Total rows: {len(df_train):,}")
+        print(f"  Label distribution: {df_train['DefaultDPD21'].value_counts().sort('DefaultDPD21')}")
 
         # Process test data
         print(f"\n{'='*60}")
@@ -164,7 +157,6 @@ def main():
 
         print(f"Processing {len(df_test_spine):,} test UserLoanIds in chunks...")
         print(f"  Lookback window: {DAYS_PRIOR} days")
-        print(f"  Max tokens: {MAX_TOKENS}")
 
         test_chunks = []
         test_user_loan_ids = [str(uid) for uid in df_test_spine['UserLoanId']]
@@ -176,12 +168,19 @@ def main():
             days_prior=DAYS_PRIOR,
             separator=SMS_SEPARATOR
         ), start=1):
-            df_chunk = process_sms_chunk(df_sms, df_test_labels, tokenizer, max_tokens=MAX_TOKENS)
-            print_chunk_stats(i, df_sms, df_chunk)
+            # Simple join with labels (no tokenization needed for TF-IDF)
+            df_chunk = df_sms.join(df_test_labels, on=['UserLoanId', 'CreatedAt'], how='inner')
+            print(f"\nChunk {i}:")
+            print(f"  SMS rows before join: {len(df_sms):,}")
+            print(f"  Rows after join: {len(df_chunk):,}")
             test_chunks.append(df_chunk)
 
         df_test = pl.concat(test_chunks)
-        print_final_stats(df_test, "Test")
+        print(f"\n{'='*60}")
+        print(f"Test Data Summary")
+        print(f"{'='*60}")
+        print(f"  Total rows: {len(df_test):,}")
+        print(f"  Label distribution: {df_test['DefaultDPD21'].value_counts().sort('DefaultDPD21')}")
 
         # Save processed data to cache
         print(f"\nSaving processed data to cache...")
@@ -199,18 +198,24 @@ def main():
     print(f"y_train: {len(y_train):,} labels")
     print(f"Unique labels: {sorted(set(y_train))}")
 
-    # Initialize encoder
-    print(f"\nInitializing SbertSupConEncoder...")
-    encoder = SbertSupConEncoder(
-        base_model_name=MODEL_NAME,
-        embedding_dim=EMBEDDING_DIM,
-        n_epochs=N_EPOCHS,
-        batch_size=BATCH_SIZE,
-        lr=LEARNING_RATE,
-        temperature=TEMPERATURE,
-        device=DEVICE,
-        random_state=RANDOM_STATE,
-        gradient_checkpointing=GRADIENT_CHECKPOINTING
+    # Initialize TF-IDF encoder with Decision Tree feature selection
+    print(f"\nInitializing TfidfSupDTEncoder...")
+    print(f"  Top features to select: {N_FEATURES}")
+    print(f"  Max features for initial TF-IDF: {MAX_FEATURES}")
+    print(f"  N-gram range: {NGRAM_RANGE}")
+    print(f"  Decision Tree max depth: {DT_MAX_DEPTH}")
+    print(f"  Parallel jobs: {N_JOBS} ({'all CPUs' if N_JOBS == -1 else f'{N_JOBS} CPUs'})")
+
+    encoder = TfidfSupDTEncoder(
+        n_features=N_FEATURES,
+        max_features=MAX_FEATURES,
+        min_df=MIN_DF,
+        max_df=MAX_DF,
+        ngram_range=NGRAM_RANGE,
+        dt_max_depth=DT_MAX_DEPTH,
+        dt_min_samples_split=DT_MIN_SAMPLES_SPLIT,
+        n_jobs=N_JOBS,
+        random_state=RANDOM_STATE
     )
 
     # Train the model
@@ -222,6 +227,12 @@ def main():
     print(f"\n{'='*60}")
     print("Training Complete!")
     print(f"{'='*60}")
+
+    # Display top features
+    print(f"\nTop 20 Most Important Features:")
+    feature_importances = encoder.get_feature_importances()
+    for i, (feature, importance) in enumerate(list(feature_importances.items())[:20], 1):
+        print(f"  {i:2d}. {feature:30s} - {importance:.6f}")
 
     # Save encoder and data to cache
     print(f"\nSaving to cache...")

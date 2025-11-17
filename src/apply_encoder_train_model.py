@@ -1,11 +1,11 @@
 """
-Script to apply the trained encoder and train an XGBoost model.
+Script to apply the trained TF-IDF encoder and train classification models.
 
 This script:
-1. Loads the cached encoder and processed data
-2. Applies the encoder to generate embeddings for train and test sets
-3. Trains an XGBoost classifier on the embeddings
-4. Evaluates the model using ROC AUC score
+1. Loads the cached TF-IDF encoder and processed data
+2. Applies the encoder to generate TF-IDF features for train and test sets
+3. Trains classification models (XGBoost, Logistic Regression, Neural Network) on the features
+4. Evaluates the models using ROC AUC score
 """
 
 from data_helper import load_encoder, load_data
@@ -16,8 +16,11 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc
+from datetime import datetime
+import json
 
 
 # ============================================================================
@@ -25,36 +28,58 @@ from sklearn.metrics import roc_curve, auc
 # ============================================================================
 
 # Cache file paths
-ENCODER_CACHE_FILE = "cache/sbert_encoder.pkl"
+ENCODER_CACHE_FILE = "cache/tfidf_encoder.pkl"
 TRAIN_DATA_CACHE_FILE = "cache/train_data.parquet"
 TEST_DATA_CACHE_FILE = "cache/test_data.parquet"
-TRAIN_EMBEDDINGS_CACHE_FILE = "cache/train_embeddings.npy"
-TEST_EMBEDDINGS_CACHE_FILE = "cache/test_embeddings.npy"
+TRAIN_EMBEDDINGS_CACHE_FILE = "cache/train_tfidf_features.npy"
+TEST_EMBEDDINGS_CACHE_FILE = "cache/test_tfidf_features.npy"
 
-# Embedding generation configuration
-EMBEDDING_BATCH_SIZE = 256  # Batch size for encoding
-EMBEDDING_CHUNK_SIZE = 10000  # Number of samples to process per chunk
-USE_EMBEDDING_CACHE = True  # Whether to use cached embeddings
+# Feature generation configuration
+USE_EMBEDDING_CACHE = True  # Whether to use cached TF-IDF features
+CHUNK_SIZE = 50000  # Process in larger chunks for TF-IDF (no GPU memory constraints)
 
 # Model selection - Choose which model to train
 MODEL_TYPE = 'all'  # Options: 'xgboost', 'logistic', 'neuralnet', 'all'
 
-# XGBoost configuration - Simple model with strong regularization
-XGBOOST_PARAMS = {
-    'n_estimators': 1000,  # More trees but with strong regularization
-    'max_depth': 3,  # Very shallow trees to prevent overfitting (reduced from 8)
-    'learning_rate': 0.01,  # Very slow learning rate (reduced from 0.05)
-    'subsample': 0.5,  # Use only 50% of samples per tree (reduced from 0.8)
-    'colsample_bytree': 0.5,  # Use only 50% of features per tree (reduced from 0.8)
-    'min_child_weight': 10,  # Require more samples in leaf nodes (increased from 1)
-    'gamma': 1.0,  # Higher minimum loss reduction (increased from 0.1)
-    'reg_alpha': 1.0,  # Stronger L1 regularization (increased from 0.1)
-    'reg_lambda': 10.0,  # Much stronger L2 regularization (increased from 1.0)
+# Grid Search Configuration
+USE_GRID_SEARCH = True  # Whether to use grid search for XGBoost hyperparameter tuning
+GRID_SEARCH_CV_FOLDS = 3  # Number of cross-validation folds for grid search
+GRID_SEARCH_VERBOSE = 2  # Verbosity level for grid search (0=silent, 1=progress, 2=detailed)
+
+# XGBoost Grid Search Parameter Grid (optimized for ~36 total fits with 3 CV folds = 12 combinations)
+# Focus on more iterations since validation curve was still improving at 2000
+XGBOOST_PARAM_GRID = {
+    'n_estimators': [3000, 4000, 5000],  # Much more iterations (3 options)
+    'max_depth': [4, 5],  # Deeper trees since 4 outperformed 3 (2 options)
+    'learning_rate': [0.008, 0.01],  # Slower learning for more iterations (2 options)
+    # Fixed parameters (not searched):
+    # subsample: 0.5, colsample_bytree: 0.5, min_child_weight: 10
+    # gamma: 1.0, reg_alpha: 1.0, reg_lambda: 10.0
+}
+# Total combinations: 3 * 2 * 2 = 12 combinations
+# Total fits with 3-fold CV: 12 * 3 = 36 fits
+
+# XGBoost Base Parameters (used if grid search is disabled or as base for grid search)
+XGBOOST_BASE_PARAMS = {
+    'subsample': 0.5,  # Use only 50% of samples per tree
+    'colsample_bytree': 0.5,  # Use only 50% of features per tree
+    'min_child_weight': 10,  # Require more samples in leaf nodes
+    'gamma': 1.0,  # Higher minimum loss reduction
+    'reg_alpha': 1.0,  # Stronger L1 regularization
+    'reg_lambda': 10.0,  # Much stronger L2 regularization
     'random_state': 42,
     'eval_metric': 'auc',
     'device': 'cuda:0',  # Use GPU for training (XGBoost 3.1+ uses 'device' instead of 'gpu_id')
     'scale_pos_weight': None,  # Will be calculated based on class imbalance
-    'early_stopping_rounds': 100  # More patience for slower learning (increased from 50)
+    'early_stopping_rounds': 250  # More patience for slower learning with more iterations
+}
+
+# XGBoost Default Parameters (used when grid search is disabled)
+XGBOOST_PARAMS = {
+    'n_estimators': 2500,  # More iterations for better performance
+    'max_depth': 3,  # Very shallow trees to prevent overfitting
+    'learning_rate': 0.01,  # Slow learning rate
+    **XGBOOST_BASE_PARAMS
 }
 
 # Logistic Regression configuration
@@ -123,18 +148,18 @@ def load_embeddings(cache_file: str) -> np.ndarray:
 
 def generate_embeddings(encoder, texts: list, batch_size: int = 256, chunk_size: int = 10000) -> np.ndarray:
     """
-    Generate embeddings for a list of texts using the encoder in chunks.
+    Generate features for a list of texts using the encoder in chunks.
 
     Args:
-        encoder: Trained SbertSupConEncoder instance
+        encoder: Trained encoder instance (TfidfSupDTEncoder or SbertSupConEncoder)
         texts: List of text strings
-        batch_size: Batch size for encoding (default: 256)
+        batch_size: Batch size for encoding (default: 256, not used for TF-IDF)
         chunk_size: Number of samples to process per chunk (default: 10000)
 
     Returns:
-        Numpy array of embeddings
+        Numpy array of features
     """
-    print(f"  Generating embeddings for {len(texts):,} samples in chunks of {chunk_size:,}...")
+    print(f"  Generating features for {len(texts):,} samples in chunks of {chunk_size:,}...")
 
     all_embeddings = []
     num_chunks = (len(texts) + chunk_size - 1) // chunk_size
@@ -144,16 +169,157 @@ def generate_embeddings(encoder, texts: list, batch_size: int = 256, chunk_size:
         chunk_num = i // chunk_size + 1
         print(f"    Processing chunk {chunk_num}/{num_chunks} ({len(chunk_texts):,} samples)...")
 
-        # Generate embeddings for this chunk
+        # Generate features for this chunk
         chunk_embeddings = encoder.transform(chunk_texts)
         all_embeddings.append(chunk_embeddings)
 
         print(f"    ✓ Chunk {chunk_num}/{num_chunks} complete - shape: {chunk_embeddings.shape}")
 
-    # Concatenate all embeddings
+    # Concatenate all features
     embeddings = np.vstack(all_embeddings)
     print(f"  ✓ Total embeddings shape: {embeddings.shape}")
     return embeddings
+
+
+def train_xgboost_with_grid_search(X_train: np.ndarray, y_train: np.ndarray,
+                                    X_test: np.ndarray, y_test: np.ndarray,
+                                    param_grid: dict, base_params: dict) -> XGBClassifier:
+    """
+    Train an XGBoost classifier with grid search hyperparameter tuning.
+    Uses manual cross-validation to avoid sklearn compatibility issues.
+
+    Args:
+        X_train: Training embeddings
+        y_train: Training labels
+        X_test: Test embeddings
+        y_test: Test labels
+        param_grid: Dictionary of parameters to search
+        base_params: Base parameters for XGBoost
+
+    Returns:
+        Best trained XGBClassifier from grid search
+    """
+    from itertools import product
+
+    print("\n" + "="*60)
+    print("XGBoost Grid Search Hyperparameter Tuning")
+    print("="*60)
+
+    # Calculate scale_pos_weight to handle class imbalance
+    n_negative = np.sum(y_train == 0)
+    n_positive = np.sum(y_train == 1)
+    scale_pos_weight = n_negative / n_positive
+
+    print(f"  Class distribution:")
+    print(f"    Negative (No Default): {n_negative:,} ({n_negative/len(y_train)*100:.2f}%)")
+    print(f"    Positive (Default): {n_positive:,} ({n_positive/len(y_train)*100:.2f}%)")
+    print(f"    Calculated scale_pos_weight: {scale_pos_weight:.4f}")
+
+    # Update base params with calculated scale_pos_weight
+    base_params_copy = base_params.copy()
+    if base_params_copy.get('scale_pos_weight') is None:
+        base_params_copy['scale_pos_weight'] = scale_pos_weight
+
+    # Remove early_stopping_rounds from base params for grid search
+    early_stopping_rounds = base_params_copy.pop('early_stopping_rounds', None)
+
+    # Generate all parameter combinations
+    param_names = list(param_grid.keys())
+    param_values = list(param_grid.values())
+    param_combinations = list(product(*param_values))
+
+    print(f"\n  Grid Search Configuration:")
+    print(f"    CV Folds: {GRID_SEARCH_CV_FOLDS}")
+    print(f"    Total parameter combinations: {len(param_combinations)}")
+    print(f"    Total fits: {len(param_combinations) * GRID_SEARCH_CV_FOLDS}")
+    print(f"\n  Parameter grid:")
+    for param, values in param_grid.items():
+        print(f"    {param:20s}: {values}")
+
+    # Setup cross-validation
+    cv = StratifiedKFold(n_splits=GRID_SEARCH_CV_FOLDS, shuffle=True, random_state=42)
+
+    print(f"\n  Starting grid search...")
+    print(f"  This may take a while...\n")
+
+    # Track best parameters
+    best_score = -1
+    best_params = None
+    all_results = []
+
+    # Iterate through all parameter combinations
+    for idx, param_combo in enumerate(param_combinations, 1):
+        # Create parameter dictionary
+        params = dict(zip(param_names, param_combo))
+        params.update(base_params_copy)
+
+        # Cross-validation scores
+        cv_scores = []
+
+        # Perform cross-validation
+        for fold_idx, (train_idx, val_idx) in enumerate(cv.split(X_train, y_train)):
+            X_train_fold = X_train[train_idx]
+            y_train_fold = y_train[train_idx]
+            X_val_fold = X_train[val_idx]
+            y_val_fold = y_train[val_idx]
+
+            # Train model
+            model = XGBClassifier(**params)
+            model.fit(X_train_fold, y_train_fold, verbose=0)
+
+            # Evaluate on validation fold
+            y_val_proba = model.predict_proba(X_val_fold)[:, 1]
+            fold_score = roc_auc_score(y_val_fold, y_val_proba)
+            cv_scores.append(fold_score)
+
+        # Calculate mean CV score
+        mean_cv_score = np.mean(cv_scores)
+        std_cv_score = np.std(cv_scores)
+
+        all_results.append({
+            'params': dict(zip(param_names, param_combo)),
+            'mean_score': mean_cv_score,
+            'std_score': std_cv_score
+        })
+
+        # Update best parameters
+        if mean_cv_score > best_score:
+            best_score = mean_cv_score
+            best_params = dict(zip(param_names, param_combo))
+
+        # Print progress
+        if GRID_SEARCH_VERBOSE >= 1:
+            print(f"  [{idx}/{len(param_combinations)}] CV AUC: {mean_cv_score:.4f} (+/- {std_cv_score:.4f}) - {dict(zip(param_names, param_combo))}")
+
+    print(f"\n✓ Grid search complete!")
+    print(f"\n  Best parameters:")
+    for param, value in best_params.items():
+        print(f"    {param:20s}: {value}")
+    print(f"\n  Best CV ROC AUC: {best_score:.4f}")
+
+    # Train final model with best parameters and early stopping
+    print(f"\n  Training final model with best parameters...")
+
+    final_params = best_params.copy()
+    final_params.update(base_params_copy)
+
+    if early_stopping_rounds is not None:
+        final_params['early_stopping_rounds'] = early_stopping_rounds
+        print(f"  Using early stopping with patience={early_stopping_rounds}")
+
+    final_model = XGBClassifier(**final_params)
+    final_model.fit(
+        X_train, y_train,
+        eval_set=[(X_train, y_train), (X_test, y_test)],
+        verbose=50
+    )
+
+    print(f"\n  ✓ Training complete!")
+    if hasattr(final_model, 'best_iteration'):
+        print(f"    Best iteration: {final_model.best_iteration}")
+        print(f"    Best score: {final_model.best_score:.4f}")
+
+    return final_model
 
 
 def train_xgboost(X_train: np.ndarray, y_train: np.ndarray,
@@ -366,6 +532,91 @@ def plot_roc_curves(y_test: np.ndarray, results: dict):
     plt.close()
 
 
+def save_model_results(results: dict, train_results: dict, filename: str = "cache/model_results.txt"):
+    """
+    Save model parameters and performance metrics to a text file.
+
+    Args:
+        results: Dictionary with model names as keys and (test_auc, y_test_proba) as values
+        train_results: Dictionary with model names as keys and train_auc as values
+        filename: Path to save the results file
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with open(filename, 'w') as f:
+        f.write("="*80 + "\n")
+        f.write("MODEL TRAINING RESULTS - TF-IDF SMS CLASSIFICATION\n")
+        f.write("="*80 + "\n")
+        f.write(f"Timestamp: {timestamp}\n")
+        f.write(f"{'='*80}\n\n")
+
+        # XGBoost Configuration
+        f.write("XGBOOST CONFIGURATION\n")
+        f.write("-"*80 + "\n")
+        f.write(f"  Grid Search Enabled     : {USE_GRID_SEARCH}\n")
+        if USE_GRID_SEARCH:
+            f.write(f"  CV Folds                : {GRID_SEARCH_CV_FOLDS}\n")
+            f.write(f"\n  Parameter Grid:\n")
+            for param, values in XGBOOST_PARAM_GRID.items():
+                f.write(f"    {param:25s}: {values}\n")
+            f.write(f"\n  Base Parameters:\n")
+            for param, value in XGBOOST_BASE_PARAMS.items():
+                f.write(f"    {param:25s}: {value}\n")
+        else:
+            f.write(f"\n  Parameters:\n")
+            for param, value in XGBOOST_PARAMS.items():
+                f.write(f"    {param:25s}: {value}\n")
+        f.write("\n")
+
+        # Logistic Regression Configuration
+        f.write("LOGISTIC REGRESSION CONFIGURATION\n")
+        f.write("-"*80 + "\n")
+        for param, value in LOGISTIC_PARAMS.items():
+            f.write(f"  {param:25s}: {value}\n")
+        f.write("\n")
+
+        # Neural Network Configuration
+        f.write("NEURAL NETWORK CONFIGURATION\n")
+        f.write("-"*80 + "\n")
+        for param, value in NEURALNET_PARAMS.items():
+            f.write(f"  {param:25s}: {value}\n")
+        f.write("\n")
+
+        # Performance Results
+        f.write("="*80 + "\n")
+        f.write("PERFORMANCE RESULTS (ROC AUC)\n")
+        f.write("="*80 + "\n\n")
+
+        # Sort by test AUC (descending)
+        sorted_results = sorted(results.items(), key=lambda x: x[1][0], reverse=True)
+
+        f.write(f"{'Model':<25s} {'Train AUC':>12s} {'Test AUC':>12s} {'Overfitting':>12s}\n")
+        f.write("-"*80 + "\n")
+
+        for model_name, (test_auc, _) in sorted_results:
+            train_auc = train_results.get(model_name, 0.0)
+            overfitting = train_auc - test_auc
+            f.write(f"{model_name:<25s} {train_auc:>12.4f} {test_auc:>12.4f} {overfitting:>12.4f}\n")
+
+        f.write("\n" + "="*80 + "\n")
+        f.write("RANKING BY TEST AUC\n")
+        f.write("="*80 + "\n")
+        for i, (model_name, (test_auc, _)) in enumerate(sorted_results, 1):
+            f.write(f"  {i}. {model_name:<25s}: {test_auc:.4f}\n")
+
+        f.write("\n" + "="*80 + "\n")
+        f.write("NOTES\n")
+        f.write("="*80 + "\n")
+        f.write("- Overfitting = Train AUC - Test AUC\n")
+        f.write("- Lower overfitting indicates better generalization\n")
+        f.write("- TF-IDF features: 100 top features selected by Decision Tree\n")
+        f.write("- Spanish text preprocessing: stopwords removed, lowercase, no punctuation\n")
+        f.write("- Multiprocessing enabled for large datasets (20 parallel workers)\n")
+        f.write("\n")
+
+    print(f"\n✓ Model results saved to: {filename}")
+
+
 # ============================================================================
 # Main Execution
 # ============================================================================
@@ -412,27 +663,26 @@ def main():
         X_train_embeddings = load_embeddings(TRAIN_EMBEDDINGS_CACHE_FILE)
         X_test_embeddings = load_embeddings(TEST_EMBEDDINGS_CACHE_FILE)
 
-    # Generate embeddings if not cached
+    # Generate features if not cached
     if X_train_embeddings is None:
-        print(f"  Using batch_size={EMBEDDING_BATCH_SIZE}, chunk_size={EMBEDDING_CHUNK_SIZE}")
         print("  Training set:")
         X_train_embeddings = generate_embeddings(encoder, X_train_text,
-                                                 batch_size=EMBEDDING_BATCH_SIZE,
-                                                 chunk_size=EMBEDDING_CHUNK_SIZE)
+                                                 batch_size=256,
+                                                 chunk_size=CHUNK_SIZE)
         if USE_EMBEDDING_CACHE:
             save_embeddings(X_train_embeddings, TRAIN_EMBEDDINGS_CACHE_FILE)
 
     if X_test_embeddings is None:
-        print(f"  Using batch_size={EMBEDDING_BATCH_SIZE}, chunk_size={EMBEDDING_CHUNK_SIZE}")
         print("  Test set:")
         X_test_embeddings = generate_embeddings(encoder, X_test_text,
-                                               batch_size=EMBEDDING_BATCH_SIZE,
-                                               chunk_size=EMBEDDING_CHUNK_SIZE)
+                                               batch_size=256,
+                                               chunk_size=CHUNK_SIZE)
         if USE_EMBEDDING_CACHE:
             save_embeddings(X_test_embeddings, TEST_EMBEDDINGS_CACHE_FILE)
 
     # Dictionary to store results
     results = {}
+    train_results = {}  # Store train AUC scores
 
     # Train models based on MODEL_TYPE
     print(f"\n4. Training models (MODEL_TYPE={MODEL_TYPE})...")
@@ -441,11 +691,23 @@ def main():
         print(f"\n{'='*60}")
         print("Training XGBoost")
         print(f"{'='*60}")
-        xgb_model = train_xgboost(
-            X_train_embeddings, y_train,
-            X_test_embeddings, y_test,
-            XGBOOST_PARAMS
-        )
+
+        if USE_GRID_SEARCH:
+            print(f"  Grid search enabled: YES")
+            xgb_model = train_xgboost_with_grid_search(
+                X_train_embeddings, y_train,
+                X_test_embeddings, y_test,
+                XGBOOST_PARAM_GRID,
+                XGBOOST_BASE_PARAMS
+            )
+        else:
+            print(f"  Grid search enabled: NO")
+            xgb_model = train_xgboost(
+                X_train_embeddings, y_train,
+                X_test_embeddings, y_test,
+                XGBOOST_PARAMS
+            )
+
         train_auc, test_auc, y_train_proba, y_test_proba = evaluate_model(
             xgb_model,
             X_train_embeddings, y_train,
@@ -453,6 +715,7 @@ def main():
             model_name="XGBoost"
         )
         results['XGBoost'] = (test_auc, y_test_proba)
+        train_results['XGBoost'] = train_auc
 
     if MODEL_TYPE in ['logistic', 'all']:
         print(f"\n{'='*60}")
@@ -470,6 +733,7 @@ def main():
             model_name="Logistic Regression"
         )
         results['Logistic Regression'] = (test_auc, y_test_proba)
+        train_results['Logistic Regression'] = train_auc
 
     if MODEL_TYPE in ['neuralnet', 'all']:
         print(f"\n{'='*60}")
@@ -487,10 +751,15 @@ def main():
             model_name="Neural Network"
         )
         results['Neural Network'] = (test_auc, y_test_proba)
+        train_results['Neural Network'] = train_auc
 
     # Plot ROC curves
     print(f"\n5. Plotting ROC curves...")
     plot_roc_curves(y_test, results)
+
+    # Save model results to file
+    print(f"\n6. Saving model results...")
+    save_model_results(results, train_results)
 
     # Summary
     print(f"\n{'='*60}")
