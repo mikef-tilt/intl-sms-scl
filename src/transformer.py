@@ -23,7 +23,10 @@ class SbertSupConEncoder:
                  device=None,
                  random_state=None,
                  warm_start=False,
-                 gradient_checkpointing=False):
+                 gradient_checkpointing=False,
+                 checkpoint_path=None,
+                 checkpoint_save_steps=None,
+                 loss_function='BatchHardSoftMarginTripletLoss'):
 
         self.base_model_name = base_model_name
         self.embedding_dim = embedding_dim
@@ -35,6 +38,9 @@ class SbertSupConEncoder:
         self.random_state = random_state
         self.warm_start = warm_start # <-- Store parameter
         self.gradient_checkpointing = gradient_checkpointing
+        self.checkpoint_path = checkpoint_path
+        self.checkpoint_save_steps = checkpoint_save_steps
+        self.loss_function = loss_function
 
     def fit(self, X, y):
         """
@@ -106,15 +112,36 @@ class SbertSupConEncoder:
             batch_size=self.batch_size
         )
 
-        # Use BatchHardSoftMarginTripletLoss for supervised contrastive learning
-        # This loss works with single sentences + labels and doesn't require setting a margin
-        # It uses soft margin which adapts automatically during training
-        train_loss = losses.BatchHardSoftMarginTripletLoss(
-            model=self.model_
-        )
+        # Select loss function based on configuration
+        if self.loss_function == 'OnlineContrastiveLoss':
+            train_loss = losses.OnlineContrastiveLoss(
+                model=self.model_
+            )
+            print(f"Using OnlineContrastiveLoss (optimized for binary classification)")
+        elif self.loss_function == 'CosineSimilarityLoss':
+            train_loss = losses.CosineSimilarityLoss(
+                model=self.model_
+            )
+            print(f"Using CosineSimilarityLoss (direct cosine similarity)")
+        elif self.loss_function == 'BatchAllTripletLoss':
+            train_loss = losses.BatchAllTripletLoss(
+                model=self.model_,
+                margin=0.5
+            )
+            print(f"Using BatchAllTripletLoss (all triplets with margin=0.5)")
+        elif self.loss_function == 'BatchSemiHardTripletLoss':
+            train_loss = losses.BatchSemiHardTripletLoss(
+                model=self.model_,
+                margin=0.5
+            )
+            print(f"Using BatchSemiHardTripletLoss (semi-hard negatives with margin=0.5)")
+        else:  # Default: BatchHardSoftMarginTripletLoss
+            train_loss = losses.BatchHardSoftMarginTripletLoss(
+                model=self.model_
+            )
+            print(f"Using BatchHardSoftMarginTripletLoss (adaptive soft margin)")
 
         print(f"Training for {self.n_epochs} epochs on {len(train_examples)} new samples...")
-        print(f"Using BatchHardSoftMarginTripletLoss (no margin required, adapts automatically)")
 
         # Configure AdamW optimizer with better parameters for faster convergence
         optimizer_params = {
@@ -129,33 +156,60 @@ class SbertSupConEncoder:
         # Calculate warmup steps (10% of first epoch for faster initial learning)
         warmup_steps = int(len(train_dataloader) * 0.1)
 
-        self.model_.fit(
-            train_objectives=[(train_dataloader, train_loss)],
-            epochs=self.n_epochs,
-            optimizer_params=optimizer_params,
-            show_progress_bar=True,
-            warmup_steps=warmup_steps,
-            use_amp=True,  # Enable automatic mixed precision for faster training
-            scheduler='warmupcosine',  # Use cosine annealing with warmup for better convergence
-            weight_decay=0.02,  # Increased L2 regularization to match optimizer
-            max_grad_norm=0.5  # Tighter gradient clipping for more stability
-        )
+        # Set up checkpoint saving if requested
+        checkpoint_save_steps = self.checkpoint_save_steps
+        if checkpoint_save_steps is None and self.checkpoint_path:
+            # Default: save every 10% of an epoch
+            checkpoint_save_steps = max(1, len(train_dataloader) // 10)
+
+        if self.checkpoint_path:
+            print(f"Checkpoint saving enabled: every {checkpoint_save_steps} steps to {self.checkpoint_path}")
+            self.model_.fit(
+                train_objectives=[(train_dataloader, train_loss)],
+                epochs=self.n_epochs,
+                optimizer_params=optimizer_params,
+                show_progress_bar=True,
+                warmup_steps=warmup_steps,
+                use_amp=True,  # Enable automatic mixed precision for faster training
+                scheduler='warmupcosine',  # Use cosine annealing with warmup for better convergence
+                weight_decay=0.02,  # Increased L2 regularization to match optimizer
+                max_grad_norm=0.5,  # Tighter gradient clipping for more stability
+                checkpoint_path=self.checkpoint_path,
+                checkpoint_save_steps=checkpoint_save_steps,
+                checkpoint_save_total_limit=3  # Keep only last 3 checkpoints
+            )
+        else:
+            self.model_.fit(
+                train_objectives=[(train_dataloader, train_loss)],
+                epochs=self.n_epochs,
+                optimizer_params=optimizer_params,
+                show_progress_bar=True,
+                warmup_steps=warmup_steps,
+                use_amp=True,  # Enable automatic mixed precision for faster training
+                scheduler='warmupcosine',  # Use cosine annealing with warmup for better convergence
+                weight_decay=0.02,  # Increased L2 regularization to match optimizer
+                max_grad_norm=0.5  # Tighter gradient clipping for more stability
+            )
 
         print(f"Training completed with {warmup_steps} warmup steps, cosine annealing scheduler, and tighter gradient clipping (max_norm=0.5)")
 
         self.is_fitted_ = True
         return self
 
-    def transform(self, X):
+    def transform(self, X, show_progress_bar=True):
         """
         Transforms new text data into the learned embedding space.
+
+        Args:
+            X: Input text data
+            show_progress_bar: Whether to show progress bar during encoding
         """
         check_is_fitted(self, 'is_fitted_')
         check_array(X, dtype=object, ensure_2d=False)
         self.model_.eval()
         embeddings = self.model_.encode(
             X,
-            show_progress_bar=False,
+            show_progress_bar=show_progress_bar,
             device=self.device_,
             batch_size=self.batch_size,  # Use batch processing for GPU efficiency
             convert_to_numpy=True

@@ -229,6 +229,46 @@ def save_encoder(encoder, cache_file: str):
     print(f"\n✓ Encoder saved to: {cache_file}")
 
 
+def load_encoder_from_checkpoint(checkpoint_path: str, embedding_dim: int = 32, batch_size: int = 8):
+    """
+    Load a trained encoder from a HuggingFace checkpoint directory.
+
+    Args:
+        checkpoint_path: Path to checkpoint directory (e.g., 'cache/checkpoints/checkpoint-3114')
+        embedding_dim: Embedding dimension used during training
+        batch_size: Batch size for encoding
+
+    Returns:
+        SbertSupConEncoder instance loaded from checkpoint
+    """
+    from transformer import SbertSupConEncoder
+    from sentence_transformers import SentenceTransformer
+    import torch
+
+    print(f"\nLoading encoder from checkpoint: {checkpoint_path}")
+
+    # Load the SentenceTransformer model from checkpoint
+    model = SentenceTransformer(checkpoint_path)
+
+    # Create encoder wrapper
+    encoder = SbertSupConEncoder(
+        base_model_name=checkpoint_path,  # Will be ignored since we set model directly
+        embedding_dim=embedding_dim,
+        batch_size=batch_size
+    )
+
+    # Set the loaded model and mark as fitted
+    encoder.model_ = model
+    encoder.is_fitted_ = True
+    encoder.device_ = "cuda" if torch.cuda.is_available() else "cpu"
+    encoder.model_.to(encoder.device_)
+
+    print(f"✓ Encoder loaded from checkpoint")
+    print(f"  Device: {encoder.device_}")
+
+    return encoder
+
+
 def load_encoder(cache_file: str):
     """
     Load a trained encoder from cache file.

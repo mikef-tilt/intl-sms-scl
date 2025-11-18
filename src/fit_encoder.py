@@ -28,15 +28,15 @@ CONTAINER_NAME = "mike"
 DIRECTORY_PATH = "data-tmp/ensenada/raw"
 
 # Date ranges
-TRAIN_START_DATE = "2025-07-16"
+TRAIN_START_DATE = "2025-08-01"
 TRAIN_END_DATE = "2025-09-01"
 TEST_START_DATE = "2025-09-01"
 TEST_END_DATE = "2025-09-15"
 
 # SMS query configuration
-DAYS_PRIOR = 14
+DAYS_PRIOR = 28
 SMS_SEPARATOR = '---'
-MAX_TOKENS = 4096  # Reduced from 8192 to 4096 for faster training (mean was ~3800)
+MAX_TOKENS = 256  # MiniLM model supports 256 tokens max
 CHUNK_SIZE = 20000  # Number of UserLoanIds to process per chunk
 
 # Model configuration
@@ -44,14 +44,21 @@ CHUNK_SIZE = 20000  # Number of UserLoanIds to process per chunk
 # - 'BAAI/bge-m3': 8192 tokens, 1024 dims, multilingual, state-of-the-art (~4-5 it/s)
 # - 'jaimevera1107/all-MiniLM-L6-v2-similarity-es': 256 tokens, 384 dims, faster training (~6 it/s)
 # - 'hiiamsid/sentence_similarity_spanish_es': 512 tokens, 768 dims, slower training (~2 it/s)
-MODEL_NAME = 'BAAI/bge-m3'
-# MODEL_NAME = 'jaimevera1107/all-MiniLM-L6-v2-similarity-es'  # Uncomment for smaller, faster model
+# MODEL_NAME = 'BAAI/bge-m3'
+MODEL_NAME = 'jaimevera1107/all-MiniLM-L6-v2-similarity-es'  # Smaller, faster model
 # MODEL_NAME = 'hiiamsid/sentence_similarity_spanish_es'  # Uncomment for larger Spanish-specific model
 EMBEDDING_DIM = 32  # Reduced to 32 for faster training and better generalization
 N_EPOCHS = 1  # Keep at 1 for faster training
-BATCH_SIZE = 8  # Increased to 8 with smaller tokens (4096) and embedding dims (32)
-LEARNING_RATE = 1e-4  # Reduced from 2e-4 for larger model stability
-GRADIENT_CHECKPOINTING = True  # Enable gradient checkpointing to save GPU memory
+BATCH_SIZE = 64  # Increased to 64 with smaller model and tokens (256)
+LEARNING_RATE = 2e-5  # Standard learning rate for smaller model
+GRADIENT_CHECKPOINTING = False  # Disable for smaller model (not needed)
+
+# Loss function options (for single sentences + labels):
+# - 'BatchHardSoftMarginTripletLoss': Hardest triplets with adaptive soft margin (BEST for binary classification)
+# - 'BatchAllTripletLoss': All possible triplets (slower but more comprehensive)
+# - 'BatchSemiHardTripletLoss': Semi-hard negatives only (good balance)
+# Note: CosineSimilarityLoss and OnlineContrastiveLoss require sentence pairs, not single sentences
+LOSS_FUNCTION = 'BatchHardSoftMarginTripletLoss'
 TEMPERATURE = 0.07
 DEVICE = 'cuda'
 RANDOM_STATE = 42
@@ -61,6 +68,7 @@ CACHE_DIR = "cache"
 ENCODER_CACHE_FILE = "cache/sbert_encoder.pkl"
 TRAIN_DATA_CACHE_FILE = "cache/train_data.parquet"
 TEST_DATA_CACHE_FILE = "cache/test_data.parquet"
+CHECKPOINT_DIR = "cache/checkpoints"  # Directory for training checkpoints
 USE_CACHE = True  # Set to False to force retraining and reprocessing
 
 # ============================================================================
@@ -201,6 +209,10 @@ def main():
 
     # Initialize encoder
     print(f"\nInitializing SbertSupConEncoder...")
+
+    # Create checkpoint directory if it doesn't exist
+    Path(CHECKPOINT_DIR).mkdir(parents=True, exist_ok=True)
+
     encoder = SbertSupConEncoder(
         base_model_name=MODEL_NAME,
         embedding_dim=EMBEDDING_DIM,
@@ -210,7 +222,10 @@ def main():
         temperature=TEMPERATURE,
         device=DEVICE,
         random_state=RANDOM_STATE,
-        gradient_checkpointing=GRADIENT_CHECKPOINTING
+        gradient_checkpointing=GRADIENT_CHECKPOINTING,
+        checkpoint_path=CHECKPOINT_DIR,
+        checkpoint_save_steps=100,  # Save checkpoint every 100 steps (faster with smaller model)
+        loss_function=LOSS_FUNCTION
     )
 
     # Train the model
